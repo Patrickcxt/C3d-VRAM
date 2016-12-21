@@ -80,17 +80,59 @@ function apply_nms(all_boxes, thresh)
             if dets:dim() > 0 and dets[1][1] ~= -1 then
                 local keep = utils.nms(dets[{{}, {1, 2}}], dets[{{}, {3}}],  thresh)
                 if keep:size(1) > 0 then
-                    nms_boxes[cls_ind][v_ind] = dets:index(1, keep)
+                    nms_boxes[cls_ind][v_ind] = dets:index(1, keep:reshape(keep:size(1)))
                 end
             end
         end
     end
+    return nms_boxes
 end
 
+local function _save_detections(all_boxes, output_dir)
+    print('Saving all detected boxes to detections.h5 ...')
+    local fn = output_dir .. 'detections.h5'
+    local myFile = hdf5.open(fn, 'w')
+    local num_classes = #all_boxes
+    local num_images = #all_boxes[1]
+    myFile:write('num_classes', torch.IntTensor({num_classes}))
+    myFile:write('num_images', torch.IntTensor({num_images}))
+    for cls_ind = 1, num_classes do
+        for im_ind = 1, num_images do
+            myFile:write(string.format('det_%d_%d', cls_ind, im_ind), all_boxes[cls_ind][im_ind])
+        end
+    end
+    myFile:close()
+    print('Done')
+end
+
+local function _load_detections(output_dir)
+    print('Loading all detected boxes from detections.h5')
+    local fn = output_dir .. 'detections.h5'
+    local myFile = hdf5.open(fn, 'r')
+    local num_classes = myFile:read('num_classes'):all()[1]
+    local num_images = myFile:read('num_images'):all()[1]
+    local all_boxes = {}
+    for i = 1, num_classes do
+        all_boxes[i] = {}
+    end
+    for cls_ind = 1, num_classes do
+        for im_ind = 1, num_images do
+            all_boxes[cls_ind][im_ind] = myFile:read(string.format('det_%d_%d', cls_ind, im_ind)):all()
+        end
+    end
+    myFile:close()
+    print('Done')
+    return num_classes, num_images, all_boxes
+end
+
+max_per_set = {41, 488, 106, 98, 217,
+               138, 170, 388, 48, 36, 
+               242, 135, 169, 142, 399, 
+               144, 48, 141, 88, 120
+}
 
 function test_net_slidingwindow()
     local f = io.open(opt.predPath, 'w')
-    --local f = io.open(opt.predPath, 'a')
 
     --agent:evaluate()
     classifier:evaluate()
@@ -98,8 +140,24 @@ function test_net_slidingwindow()
     local softmax = nn.SoftMax()
     local dh = ThumosDataSet()
     local iter = 0
+
+    local videos = {}
+    local durations = {}
+    local num_videos = 212
+
+    local max_per_video = 100
+    local thresh = torch.ones(opt.num_classes) * -math.huge
+    local top_scores = {}
+    local all_boxes = {}
+    for i = 1, opt.num_classes do
+        top_scores[i] = torch.Tensor(1):fill(-math.huge)
+        all_boxes[i] = {}
+    end
+
+    local v = 1
     while true do
         local video_name, infos, video, labels, segments = dh:getTestSample()
+        table.insert(videos, video_name)
         print("Iter: ", iter, video_name)
         iter = iter + 1
 
@@ -107,19 +165,23 @@ function test_net_slidingwindow()
             break
         end
         local duration = infos[1]
-        --print(labels)
-        --print(segments)
+        table.insert(durations, duration)
+        local num_frames = infos[3]
 
-        local seg_pred_set = {}
-        local cls_pred_set = {}
-        local scores = {}
+        --print(labels:reshape(labels:size(1)))
+        print(thresh)
+        --print(segments*duration)
+
+        local pred_set = {}
+        for i = 1, opt.num_classes do
+            pred_set[i] = torch.Tensor(1, 3):fill(-1)
+        end
 
         for l = 0.015, 0.015, 0.04 do
             local step = l / 2
             for st = 0.0, 1-l, step do
-                local pred = torch.Tensor({st, st+l})
-                --print(pred)
-                local idt = dh:get_idt_seg_mid(video, pred)
+                local seg_pred = torch.Tensor({st, st+l})
+                local idt = dh:get_idt_seg(video, seg_pred)
                 local num_idt = idt[{{1, 4000}}]:sum()
                 if num_idt > 0 then
                     idt = idt:div(num_idt)
@@ -129,37 +191,87 @@ function test_net_slidingwindow()
                 cls_pred = cls_pred:double()
                 cls_pred = softmax:forward(cls_pred)
                 local maxVal, maxId = torch.max(cls_pred, 1)
-                if maxVal[1] > opt.conf then
-                    table.insert(seg_pred_set, {pred[1], pred[2]})
-                    table.insert(cls_pred_set, maxId[1])
-                    table.insert(scores, maxVal[1])
+
+                local cls, score = maxId[1], maxVal[1]
+                if score > thresh[cls] then
+                    local pred = torch.Tensor({{seg_pred[1], seg_pred[2], score}})
+                    pred_set[cls] = pred_set[cls]:cat(pred, 1)
                 end
             end
 
-            --print('========================================\n\n')
-            --io.read()
         end
-        seg_pred_set, cls_pred_set, scores = apply_nms(seg_pred_set, cls_pred_set, scores, opt.num_classes)  -- apply nms 
-        for j = 1, #seg_pred_set do
-            line = video_name .. '\t' .. string.format('%.1f', seg_pred_set[j][1] * duration) .. '\t' .. string.format('%.1f', seg_pred_set[j][2] * duration)
-                .. '\t' .. cls_pred_set[j] .. '\t' .. tostring(scores[j]) .. '\n'
-            --print(line)
-            f:write(line)
-        end
-        --io.read()
 
+        for i = 1, opt.num_classes do
+            repeat
+                if pred_set[i]:size(1) > 1 then 
+                    pred_set[i] = pred_set[i][{{2, -1}, {}}]
+                else
+                    all_boxes[i][v] = pred_set[i]
+                    break
+                end
+                local scores, inds = torch.sort(pred_set[i][{{}, {3}}], 1, true)
+                local max_this_video = math.min(max_per_video, inds:size(1))
+                scores = scores[{{1, max_this_video}, {}}]
+                pred_set[i] = pred_set[i]:index(1, inds[{{1, max_this_video}, {}}]:reshape(max_this_video))
+
+                -- push new scores to minheap
+                top_scores[i] = top_scores[i]:cat(scores:reshape(max_this_video))
+                if top_scores[i]:size(1) > max_per_set[i]*8 then
+                    top_scores[i], _ = top_scores[i]:sort()
+                    local st = top_scores[i]:size(1) - max_per_set[i]*8 + 1
+                    top_scores[i] = top_scores[i][{{st, -1}}]
+                    thresh[i] = top_scores[i][1]
+                end
+
+                all_boxes[i][v] = pred_set[i]
+            until true
+            
+        end
+
+        v = v + 1
     end
+
+
+    for j = 1, opt.num_classes - 1 do
+        for i = 1, num_videos do
+            local inds = all_boxes[j][i][{{}, {1}}]:gt(thresh[j])
+            local num_keep = inds:sum()
+            if num_keep == 0 then
+                all_boxes[j][i] = torch.Tensor(1, 3):fill(-1)
+            else
+                inds = inds:cat(inds):cat(inds)
+                all_boxes[j][i] = all_boxes[j][i][inds]:reshape(num_keep, 3)
+            end
+        end
+    end
+
+    local output_dir = './cache/'
+    print('Saving detection to file')
+    _save_detections(all_boxes, output_dir)
+    --print('Loading detection from file')
+    --_, _, all_boxes = _load_detections(output_dir)
+    --print(all_boxes)
+
+    local nms_dets = apply_nms(all_boxes, opt.nms)
+    for j = 1, num_videos do
+        for i = 1, opt.num_classes do
+            if nms_dets[i][j]:dim() > 0 then
+                for k = 1, nms_dets[i][j]:size(1) do
+                    line = videos[j] .. '\t' .. string.format('%.1f', nms_dets[i][j][k][1] * durations[j]) .. '\t' .. string.format('%.1f', nms_dets[i][j][k][2] * durations[j])
+                    .. '\t' .. i .. '\t' .. tostring(nms_dets[i][j][k][3] ) .. '\n'
+                    --print(line)
+                    f:write(line)
+                end
+            end
+        end
+    end
+
     f:close()
     print("Done...")
 end
 
 -- mode 3
 
-max_per_set = {41, 488, 106, 98, 217,
-               138, 170, 388, 48, 36, 
-               242, 135, 169, 142, 399, 
-               144, 48, 141, 88, 120
-}
 
 function test_net_idtdensity()
     local f = io.open(opt.predPath, 'w')
@@ -173,9 +285,10 @@ function test_net_idtdensity()
     local iter = 0
 
     local videos = {}
+    local durations = {}
     local num_videos = 212
 
-    local max_per_video = 80
+    local max_per_video = 100
     --local max_per_set = 5 * 212
     local thresh = torch.ones(opt.num_classes) * -math.huge
     local top_scores = {}
@@ -196,6 +309,8 @@ function test_net_idtdensity()
             break
         end
         local duration = infos[1]
+        table.insert(durations, duration)
+
         local num_frames = infos[3]
 
         --print(labels:reshape(labels:size(1)))
@@ -207,34 +322,39 @@ function test_net_idtdensity()
             pred_set[i] = torch.Tensor(1, 3):fill(-1)
         end
 
-        local density, _ = dh:plot_idt_density(video)
-        for i = 5, density:size(1)-4 do
-            local num_idt = 0
-            for j = i-4, i+4, 2 do
-                num_idt = num_idt + video[j][{{1, 4000}}]:sum()
-            end
-            if density[i] > density[i-1] and density[i] > density[i+1] and num_idt/5.0 > 600 then
-                local l = (16 * i) / num_frames
-                local seg_pred = torch.Tensor({math.max(0.0, l-0.0075), math.min(duration, l+0.0075)})
-                
-                local idt = torch.zeros(16000)
-                for j = i-4, i+4, 2 do
-                    idt = idt + video[j]
-                end
-                idt:div(num_idt)
-                idt = idt:cuda()
-                local cls_pred = classifier:forward(idt)
-                cls_pred = cls_pred:double()
-                cls_pred = softmax:forward(cls_pred)
-                
-                local maxVal, maxId = torch.max(cls_pred, 1)
-                local cls, score = maxId[1], maxVal[1]
-                --print(cls, score)
-                --io.read()
+        local nc = {3, 7}
+        local du = {0.0075, 0.02}
 
-                if score > thresh[cls] then
-                    local pred = torch.Tensor({{seg_pred[1], seg_pred[2], score}})
-                    pred_set[cls] = pred_set[cls]:cat(pred, 1)
+        local density, _ = dh:plot_idt_density(video)
+        for d = 1, 2 do
+            for i = nc[d], density:size(1)-nc[d]+1 do
+                local num_idt = 0
+                for j = i-nc[d]+1, i+nc[d]-1, 2 do
+                    num_idt = num_idt + video[j][{{1, 4000}}]:sum()
+                end
+                if density[i] > density[i-1] and density[i] > density[i+1] and density[i] > 600 then
+                    local l = (16 * i) / num_frames
+                    local seg_pred = torch.Tensor({math.max(0.0, l-du[d]), math.min(duration, l+du[d])})
+                    
+                    local idt = torch.zeros(16000)
+                    for j = i-nc[d]+1, i+nc[d]-1, 2 do
+                        idt = idt + video[j]
+                    end
+                    idt:div(num_idt)
+                    idt = idt:cuda()
+                    local cls_pred = classifier:forward(idt)
+                    cls_pred = cls_pred:double()
+                    cls_pred = softmax:forward(cls_pred)
+                    
+                    local maxVal, maxId = torch.max(cls_pred, 1)
+                    local cls, score = maxId[1], maxVal[1]
+                    --print(cls, score)
+                    --io.read()
+
+                    if score > thresh[cls] then
+                        local pred = torch.Tensor({{seg_pred[1], seg_pred[2], score}})
+                        pred_set[cls] = pred_set[cls]:cat(pred, 1)
+                    end
                 end
             end
         end
@@ -254,9 +374,9 @@ function test_net_idtdensity()
 
                 -- push new scores to minheap
                 top_scores[i] = top_scores[i]:cat(scores:reshape(max_this_video))
-                if top_scores[i]:size(1) > max_per_set[i]*2 then
+                if top_scores[i]:size(1) > max_per_set[i]*5 then
                     top_scores[i], _ = top_scores[i]:sort()
-                    local st = top_scores[i]:size(1) - max_per_set[i]*2 + 1
+                    local st = top_scores[i]:size(1) - max_per_set[i]*5 + 1
                     top_scores[i] = top_scores[i][{{st, -1}}]
                     thresh[i] = top_scores[i][1]
                 end
@@ -280,7 +400,7 @@ function test_net_idtdensity()
             local inds = all_boxes[j][i][{{}, {1}}]:gt(thresh[j])
             local num_keep = inds:sum()
             if num_keep == 0 then
-                all_boxes[j][i] = torch.zeros(1, 3)
+                all_boxes[j][i] = torch.Tensor(1, 3):fill(-1)
             else
                 inds = inds:cat(inds):cat(inds)
                 all_boxes[j][i] = all_boxes[j][i][inds]:reshape(num_keep, 3)
@@ -288,15 +408,23 @@ function test_net_idtdensity()
         end
     end
 
+    local output_dir = './cache/'
+    print('Saving detection to file')
+    _save_detections(all_boxes, output_dir)
+    --print('Loading detection from file')
+    --_, _, all_boxes = _load_detections(output_dir)
+    --print(all_boxes)
+
     local nms_dets = apply_nms(all_boxes, opt.nms)
-    --seg_pred_set, cls_pred_set, scores = apply_nms(seg_pred_set, cls_pred_set, scores, opt.num_classes)  -- apply nms
     for j = 1, num_videos do
         for i = 1, opt.num_classes do
-            for k = 1, nms_dets:size(1) do
-                line = videos[j] .. '\t' .. string.format('%.1f', nms_dets[i][j][k][1] * duration) .. '\t' .. string.format('%.1f', nms_dets[i][j][k][2] * duration)
-                .. '\t' .. i .. '\t' .. tostring(det_nms[i][j][k][3] ) .. '\n'
-                print(line)
-                f:write(line)
+            if nms_dets[i][j]:dim() > 0 then
+                for k = 1, nms_dets[i][j]:size(1) do
+                    line = videos[j] .. '\t' .. string.format('%.1f', nms_dets[i][j][k][1] * durations[j]) .. '\t' .. string.format('%.1f', nms_dets[i][j][k][2] * durations[j])
+                    .. '\t' .. i .. '\t' .. tostring(nms_dets[i][j][k][3] ) .. '\n'
+                    --print(line)
+                    f:write(line)
+                end
             end
         end
     end
@@ -306,6 +434,6 @@ function test_net_idtdensity()
 end
 
 
---test_net_slidingwindow()
-test_net_idtdensity()
+test_net_slidingwindow()
+--test_net_idtdensity()
 

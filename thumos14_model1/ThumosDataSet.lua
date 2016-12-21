@@ -235,7 +235,8 @@ end
 
 function ThumosDataSet:getTestSample()
     if self._iter == 1 then
-        self._perm = torch.randperm(#self.testVideos)
+        --self._perm = torch.randperm(#self.testVideos)
+        self._perm = torch.range(1, #self.testVideos)
     end
     if self._iter > #self.testVideos then
         return nil

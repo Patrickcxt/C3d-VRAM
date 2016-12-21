@@ -85,6 +85,7 @@ function utils.nms(segs, scores, thresh)
         return pick
     end
     local vals, I = scores:sort(1)
+    I = I:resize(I:size(1))
     pick:resize(scores:size()):zero()
     local counter = 1
     while I:numel() > 0 do
@@ -96,7 +97,7 @@ function utils.nms(segs, scores, thresh)
             break
         end
         I = I[{{1, last-1}}]
-        local overlap = utils.interval_overlap(segs:index(1, I), segs[i]:resize(1, 2))
+        local overlap = utils.interval_overlap(segs:index(1, I:reshape(I:size(1))), segs[i]:resize(1, 2))
         I = I[overlap:le(thresh)]
     end
 
